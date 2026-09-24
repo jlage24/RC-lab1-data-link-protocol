@@ -33,10 +33,11 @@ int llOpenTx(LinkLayer llParameters)
     // Create string to send
     unsigned char buf[BUF_SIZE] = {0};
 
-    for (int i = 0; i < BUF_SIZE; i++)
-    {
-        buf[i] = 'a' + i % 26;
-    }
+    buf[0]= 0x7E;
+    buf[1]= 0x03;
+    buf[2]= 0x03;
+    buf[3]= 0x00;
+    buf[4]= 0x7E;
 
     // In non-canonical mode, '\n' does not end the writing.
     // Test this condition by placing a '\n' in the middle of the buffer.
@@ -94,12 +95,18 @@ int llOpenRx(LinkLayer llParameters)
         int bytes = readByteSerialPort(&byte);
         nBytesBuf += bytes;
 
-        printf("Byte received: %c\n", byte);
 
-        if (byte == 'z')
+        if (byte == 0X7E)
         {
-            printf("Received 'z' char. Stop reading from serial port.\n");
-            STOP = TRUE;
+
+            printf("var = 0x%02X\n", byte);
+
+            if (byte == 0X7E){
+                printf("Received ending flag. Stop reading from serial port.\n");
+                STOP = TRUE;
+            }
+
+           
         }
     }
 
