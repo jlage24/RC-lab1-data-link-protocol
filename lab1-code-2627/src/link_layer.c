@@ -5,7 +5,9 @@
 #include "link_layer.h"
 #include "serial_port.h"
 
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #define FLAG   0x7E
@@ -15,14 +17,28 @@
 
 typedef enum { ST_START, ST_FLAG, ST_A, ST_C, ST_BCC, ST_STOP } State;
 
+static volatile int alarmEnabled = 0;
+static volatile int alarmCount = 0;
 
-static void waitFrame(unsigned char a, unsigned char c)
+static void alarmHandler(int sig)
+{
+    alarmEnabled = 0;
+    alarmCount++;
+    printf("Alarm #%d received\n", alarmCount);
+}
+
+// withTimeout = 1 (Tx): returns 0 if the alarm fires before a frame arrives
+// withTimeout = 0 (Rx): blocks until a valid frame arrives
+static int waitFrame(unsigned char a, unsigned char c, int withTimeout)
 {
     State state = ST_START;
     unsigned char byte;
 
     while (state != ST_STOP)
     {
+        if (withTimeout && !alarmEnabled)
+            return 0;
+
         if (readByteSerialPort(&byte) <= 0)
             continue;
 
@@ -53,6 +69,7 @@ static void waitFrame(unsigned char a, unsigned char c)
             break;
         }
     }
+    return 1;
 }
 
 int llOpenTx(LinkLayer llParameters)
@@ -64,11 +81,40 @@ int llOpenTx(LinkLayer llParameters)
     }
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG};
-    int bytes = writeBytesSerialPort(set, 5);
-    printf("SET sent (%d bytes)\n", bytes);
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        exit(1);
+    }
 
-    waitFrame(A_TX, C_UA);   // UA: A=0x03, C=0x07, BCC=0x04
+    unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG};
+    int connected = 0;
+    alarmCount = 0;
+
+    while (alarmCount < llParameters.nRetransmissions && !connected)
+    {
+        writeBytesSerialPort(set, 5);
+        printf("SET sent (attempt %d)\n", alarmCount + 1);
+
+        alarmEnabled = 1;
+        alarm(llParameters.timeout);
+
+        if (waitFrame(A_TX, C_UA, 1))
+        {
+            alarm(0);   // disable the pending alarm
+            connected = 1;
+        }
+    }
+
+    if (!connected)
+    {
+        printf("No UA received after %d attempts. Giving up.\n", alarmCount);
+        closeSerialPort();
+        return -1;
+    }
+
     printf("Received valid UA frame. Connection established!\n");
 
     sleep(1);
@@ -89,7 +135,7 @@ int llOpenRx(LinkLayer llParameters)
     }
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    waitFrame(A_TX, C_SET);
+    waitFrame(A_TX, C_SET, 0);
     printf("Received valid SET frame\n");
 
     unsigned char ua[5] = {FLAG, A_TX, C_UA, A_TX ^ C_UA, FLAG};
