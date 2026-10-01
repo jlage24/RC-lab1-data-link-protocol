@@ -44,8 +44,51 @@ int llOpenTx(LinkLayer llParameters)
     // The whole buffer must be sent even with the '\n'.
     buf[5] = '\n';
 
-    int bytes = writeBytesSerialPort(buf, BUF_SIZE);
+    int bytes = writeBytesSerialPort(buf, 5);
     printf("%d bytes written to serial port\n", bytes);
+
+    typedef enum {
+        START,
+        FLAG_RCV,
+        A_RCV,
+        C_RCV,
+        BCC_OK,
+        STOP
+    } State;
+
+    State state = START;
+    unsigned char byte;
+
+    while (state!=Stop){
+        if (readByteSerialPort(&byte) >0){
+            switch(state){
+                case START:
+                    if (byte ==0x7E) state = FLAG_RCV;
+                    break;
+                case FLAG_RCV:
+                    if (byte == 0x01) state = A_RCV;
+                    else if (byte != 0x7E) state = START;
+                    break;
+                case A_RCV:
+                    if (byte == 0x07) state = C_RCV; 
+                    else if (byte == 0x7E) state = FLAG_RCV;
+                    else state = START;
+                    break
+                case C_RCV:
+                    if (byte == (0x01 ^ 0x07)) state = BCC_OK; 
+                    else if (byte == 0x7E) state = FLAG_RCV;
+                    else state = START;
+                    break;
+                case BCC_OK:
+                    if (byte == 0x7E) state = STOP; 
+                    else state = START;
+                    break;
+                default:
+                    break;       
+
+            }
+        }
+    }
 
     // Wait until all bytes have been written to the serial port
     sleep(1);
@@ -57,7 +100,7 @@ int llOpenTx(LinkLayer llParameters)
         return -1;
     }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    printf("Received valid UA frame. Connection established successfully!\n", llParameters.serialPort);
 
     return 0;
 }
@@ -83,6 +126,16 @@ int llOpenRx(LinkLayer llParameters)
     // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
 
     // TODO: Save the received bytes in a buffer array and print it at the end of the program.
+
+    typedef enum {
+        START,
+        FLAG_RCV,
+        A_RCV,
+        C_RCV,
+        BCC_OK,
+        STOP
+    } State;
+
     volatile int STOP = FALSE;
     int nBytesBuf = 0;
 
