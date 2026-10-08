@@ -8,36 +8,58 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define FLAG   0x7E
-#define A_TX   0x03   // frames from Tx / answers from Rx
+#define ESC    0x7D
+#define A_TX   0x03   // commands from Tx / replies from Rx
+#define A_RX   0x01   // commands from Rx / replies from Tx
 #define C_SET  0x03
 #define C_UA   0x07
+#define C_DISC 0x0B
+#define C_RR0  0xAA
+#define C_RR1  0xAB
+#define C_REJ0 0x54
+#define C_REJ1 0x55
+#define C_I0   0x00
+#define C_I1   0x80
 
 typedef enum { ST_START, ST_FLAG, ST_A, ST_C, ST_BCC, ST_STOP } State;
 
 static volatile int alarmEnabled = 0;
-static volatile int alarmCount = 0;
+static LinkLayer params;      // saved at llOpen*, used by llSend/llClose*
+static int txNs = 0;          // Tx: Ns of the next I frame to send
+static int rxExpected = 0;    // Rx: Ns of the I frame we expect next
 
 static void alarmHandler(int sig)
 {
     alarmEnabled = 0;
-    alarmCount++;
-    printf("Alarm #%d received\n", alarmCount);
 }
 
-// withTimeout = 1 (Tx): returns 0 if the alarm fires before a frame arrives
-// withTimeout = 0 (Rx): blocks until a valid frame arrives
-static int waitFrame(unsigned char a, unsigned char c, int withTimeout)
+static void installAlarm(void)
+{
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;   // no SA_RESTART: read() must be interrupted
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        exit(1);
+    }
+}
+
+// Reads ONE supervision/unnumbered frame (F A C BCC1 F) with address 'a'.
+// Returns the C byte received, or -1 if the timeout expired (only if withTimeout).
+// Any C is accepted here; the caller decides what to do with it.
+static int readSFrame(unsigned char a, int withTimeout)
 {
     State state = ST_START;
-    unsigned char byte;
+    unsigned char byte, c = 0;
 
     while (state != ST_STOP)
     {
         if (withTimeout && !alarmEnabled)
-            return 0;
+            return -1;
 
         if (readByteSerialPort(&byte) <= 0)
             continue;
@@ -52,9 +74,8 @@ static int waitFrame(unsigned char a, unsigned char c, int withTimeout)
             else if (byte != FLAG) state = ST_START;
             break;
         case ST_A:
-            if (byte == c) state = ST_C;
-            else if (byte == FLAG) state = ST_FLAG;
-            else state = ST_START;
+            if (byte == FLAG) state = ST_FLAG;
+            else { c = byte; state = ST_C; }
             break;
         case ST_C:
             if (byte == (a ^ c)) state = ST_BCC;
@@ -69,108 +90,189 @@ static int waitFrame(unsigned char a, unsigned char c, int withTimeout)
             break;
         }
     }
-    return 1;
+    return c;
 }
 
-int llOpenTx(LinkLayer llParameters)
+static void sendSFrame(unsigned char a, unsigned char c)
 {
-    if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
+    unsigned char f[5] = {FLAG, a, c, a ^ c, FLAG};
+    writeBytesSerialPort(f, 5);
+}
+
+// Sends 'c' (address a) and waits for 'expected' (address ea), retrying on timeout.
+static int sendAndWait(unsigned char a, unsigned char c, unsigned char ea, unsigned char expected)
+{
+    for (int attempt = 0; attempt < params.nRetransmissions; attempt++)
+    {
+        sendSFrame(a, c);
+        alarmEnabled = 1;
+        alarm(params.timeout);
+        int r = readSFrame(ea, 1);
+        alarm(0);
+        if (r == expected) return 0;
+    }
+    return -1;
+}
+
+static int openPort(LinkLayer p)
+{
+    params = p;
+    txNs = 0;
+    rxExpected = 0;
+    if (openSerialPort(p.serialPort, p.baudRate) < 0)
     {
         perror("openSerialPort");
         return -1;
     }
-    printf("Serial port %s opened\n", llParameters.serialPort);
+    installAlarm();
+    return 0;
+}
 
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1)
+int llOpenTx(LinkLayer llParameters)
+{
+    if (openPort(llParameters) < 0) return -1;
+    if (sendAndWait(A_TX, C_SET, A_TX, C_UA) < 0)
     {
-        perror("sigaction");
-        exit(1);
-    }
-
-    unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG};
-    int connected = 0;
-    alarmCount = 0;
-
-    while (alarmCount < llParameters.nRetransmissions && !connected)
-    {
-        writeBytesSerialPort(set, 5);
-        printf("SET sent (attempt %d)\n", alarmCount + 1);
-
-        alarmEnabled = 1;
-        alarm(llParameters.timeout);
-
-        if (waitFrame(A_TX, C_UA, 1))
-        {
-            alarm(0);   // disable the pending alarm
-            connected = 1;
-        }
-    }
-
-    if (!connected)
-    {
-        printf("No UA received after %d attempts. Giving up.\n", alarmCount);
+        printf("No UA received after %d attempts. Giving up.\n", params.nRetransmissions);
         closeSerialPort();
         return -1;
     }
-
-    printf("Received valid UA frame. Connection established!\n");
-
-    sleep(1);
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
+    printf("Connection established (UA received)\n");
     return 0;
 }
 
 int llOpenRx(LinkLayer llParameters)
 {
-    if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
-    {
-        perror("openSerialPort");
-        return -1;
-    }
-    printf("Serial port %s opened\n", llParameters.serialPort);
-
-    waitFrame(A_TX, C_SET, 0);
-    printf("Received valid SET frame\n");
-
-    unsigned char ua[5] = {FLAG, A_TX, C_UA, A_TX ^ C_UA, FLAG};
-    int bytes = writeBytesSerialPort(ua, 5);
-    for (int i = 0; i < 5; i++)
-        printf("var = 0x%02X\n", ua[i]);
-    printf("UA sent (%d bytes)\n", bytes);
-
-    sleep(1);
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
+    if (openPort(llParameters) < 0) return -1;
+    while (readSFrame(A_TX, 0) != C_SET) ;
+    sendSFrame(A_TX, C_UA);
+    printf("Connection established (SET received, UA sent)\n");
     return 0;
 }
 
 ////////////////////////////////////////////////
-// LLSEND
+// LLSEND  (Tx side of Stop & Wait)
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
+    // worst case: every byte (data + BCC2) is stuffed -> 2x, plus 6 header/trailer bytes
+    unsigned char *frame = malloc(2 * (bufSize + 1) + 6);
+    if (!frame) return -1;
 
-    return 0;
+    int n = 0;
+    frame[n++] = FLAG;
+    frame[n++] = A_TX;
+    frame[n++] = txNs ? C_I1 : C_I0;
+    frame[n++] = frame[1] ^ frame[2];                 // BCC1
+
+    unsigned char bcc2 = 0;
+    for (int i = 0; i <= bufSize; i++)                // i == bufSize -> BCC2 itself
+    {
+        unsigned char b = (i < bufSize) ? buf[i] : bcc2;
+        if (i < bufSize) bcc2 ^= b;                   // BCC2 over ORIGINAL bytes
+        if (b == FLAG || b == ESC) { frame[n++] = ESC; frame[n++] = b ^ 0x20; }
+        else frame[n++] = b;
+    }
+    frame[n++] = FLAG;
+
+    int attempts = 0;
+    while (attempts < params.nRetransmissions)
+    {
+        writeBytesSerialPort(frame, n);
+        attempts++;
+
+        alarmEnabled = 1;
+        alarm(params.timeout);
+        int r = readSFrame(A_TX, 1);
+        alarm(0);
+
+        unsigned char rrOk = txNs ? C_RR0 : C_RR1;    // RR(Ns+1)
+        if (r == rrOk)
+        {
+            txNs ^= 1;
+            free(frame);
+            return bufSize;
+        }
+        // REJ, RR with the old Nr, or timeout (-1): retransmit
+        printf("llSend: %s, retransmitting (attempt %d/%d)\n",
+               r < 0 ? "timeout" : "REJ/bad ack", attempts, params.nRetransmissions);
+    }
+    free(frame);
+    return -1;
 }
 
 ////////////////////////////////////////////////
-// LLRECEIVE
+// LLRECEIVE  (Rx side of Stop & Wait)
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet)
 {
-    // TODO: Implement this function
+    unsigned char rr[2]  = {C_RR0, C_RR1};
+    unsigned char rej[2] = {C_REJ0, C_REJ1};
 
-    return 0;
+    for (;;)
+    {
+        // ---- state machine for an I frame ----
+        enum { S_START, S_FLAG, S_A, S_C, S_BCC1, S_DATA } st = S_START;
+        unsigned char byte, c = 0;
+        unsigned char data[2 * MAX_PAYLOAD_SIZE + 8];
+        int len = 0, esc = 0, done = 0;
+
+        while (!done)
+        {
+            if (readByteSerialPort(&byte) <= 0) continue;
+            switch (st)
+            {
+            case S_START: if (byte == FLAG) st = S_FLAG; break;
+            case S_FLAG:
+                if (byte == A_TX) st = S_A;
+                else if (byte != FLAG) st = S_START;
+                break;
+            case S_A:
+                if (byte == C_I0 || byte == C_I1) { c = byte; st = S_C; }
+                else if (byte == FLAG) st = S_FLAG;
+                else st = S_START;
+                break;
+            case S_C:
+                if (byte == (A_TX ^ c)) { st = S_BCC1; len = 0; esc = 0; }
+                else if (byte == FLAG) st = S_FLAG;
+                else st = S_START;
+                break;
+            case S_BCC1:   // first data byte (anything but FLAG)
+            case S_DATA:
+                st = S_DATA;
+                if (byte == FLAG) { done = 1; break; }
+                if (len >= (int)sizeof(data)) { st = S_START; break; }  // overflow guard
+                if (esc) { data[len++] = byte ^ 0x20; esc = 0; }
+                else if (byte == ESC) esc = 1;
+                else data[len++] = byte;
+                break;
+            }
+        }
+
+        // ---- frame complete: validate BCC2 and sequence number ----
+        int ns = (c == C_I1);
+        if (len < 1) continue;                         // no BCC2 -> garbage
+
+        unsigned char bcc2 = 0;
+        for (int i = 0; i < len - 1; i++) bcc2 ^= data[i];
+        int bcc2ok = (bcc2 == data[len - 1]);
+
+        if (ns == rxExpected)
+        {
+            if (bcc2ok)
+            {
+                rxExpected ^= 1;
+                sendSFrame(A_TX, rr[rxExpected]);      // RR(Ns+1)
+                memcpy(packet, data, len - 1);
+                return len - 1;
+            }
+            sendSFrame(A_TX, rej[rxExpected]);         // new frame, bad data -> REJ
+        }
+        else
+        {
+            sendSFrame(A_TX, rr[rxExpected]);          // duplicate: discard data, resend RR
+        }
+    }
 }
 
 ////////////////////////////////////////////////
@@ -178,14 +280,19 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    // TODO: Implement this function
-
-    return 0;
+    int r = sendAndWait(A_TX, C_DISC, A_RX, C_DISC);
+    if (r == 0) sendSFrame(A_RX, C_UA);
+    sleep(1);                                          // let the last frame leave the UART
+    closeSerialPort();
+    return r;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function
-
+    while (readSFrame(A_TX, 0) != C_DISC) ;
+    sendSFrame(A_RX, C_DISC);
+    while (readSFrame(A_RX, 0) != C_UA) ;
+    sleep(1);
+    closeSerialPort();
     return 0;
 }
